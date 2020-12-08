@@ -1,4 +1,4 @@
-pragma solidity ^0.5.7;
+pragma solidity ^0.7.5;
 
 contract IANA {
     struct Prefix {
@@ -33,7 +33,7 @@ contract IANA {
         _;
     }
 
-    constructor() public {
+    constructor() {
         // Automatically add the contract creator as an owner
         ownerList[msg.sender] = true;
         
@@ -208,8 +208,9 @@ contract IANA {
         newPrefix.ip = ip;
         newPrefix.mask = mask;
         newPrefix.owningAS = newOwnerAS;
-        uint index = prefixes.push(newPrefix) - 1;
+        prefixes.push(newPrefix);
         // Add it to the list
+        uint index = prefixes.length - 1;
         parent.subPrefixes.push(index);
     }
     
@@ -254,7 +255,7 @@ contract IANA {
                     parent.subPrefixes[i-1] = parent.subPrefixes[i];
                 }
                 // Shrink the array.
-                parent.subPrefixes.length = parent.subPrefixes.length - 1;
+                parent.subPrefixes.pop();
             }
         }
     }
