@@ -24,6 +24,8 @@ contract IANA {
     mapping (address => bool) public ownerList;
     // The associative mapping that maps ASNs to their owner's public key.
     mapping (uint32 => address) public ASNList;
+    //  The user should sign the data along with a unique nonce value each time
+    mapping (address => mapping(uint => bool)) nonceUsedMap;
     // List of prefixes.
     Prefix[] public prefixes;
     // Holds the table of links keyed by sha256(encodePacked(ASN1,ASN2))
@@ -171,15 +173,21 @@ contract IANA {
     /// @param mask The number of bits in the netmask of the prefix to add
     /// @param newOwnerAS The AS number to associate with the new prefix to.
     /// @param _signature The signature.
-    function prefix_addPrefix(uint32 ip, uint8 mask, uint32 newOwnerAS, bytes memory _signature) public {
+    function prefix_addPrefix(uint32 ip, uint8 mask, uint32 newOwnerAS, uint nonce, bytes memory _signature) public {
         // Only valid subnet masks
         require (mask <= 32);
         // Get the ASN's owner
         address newOwnerAddress = ASNList[newOwnerAS];
+        // check if the new owner has previously sent the signature with that nonce
+        require(nonceUsedMap[newOwnerAddress][nonce] == false);
         // The owning ASN must exist
         require (newOwnerAddress != address(0));
         // The owning ASN must have signed the message.
-        require(ECDSA.recover(ECDSA.toEthSignedMessageHash(IANA_getPrefixSignatureMessage(ip, mask, newOwnerAS, newOwnerAddress)), _signature) == newOwnerAddress);
+        require(ECDSA.recover(ECDSA.toEthSignedMessageHash(IANA_getPrefixSignatureMessage(ip, mask, newOwnerAS, newOwnerAddress, nonce)), _signature) == newOwnerAddress);
+        
+        // the nonce should be stored on-chain
+        nonceUsedMap[ASNOwner][nonce] = true;
+
         // Find who owns the space this mask is in.
         uint parentIndex = prefix_getContainingPrefix(0,ip, mask);
         Prefix storage parent = prefixes[parentIndex];
@@ -216,7 +224,7 @@ contract IANA {
         parent.subPrefixes.push(index);
     }
     
-    /// Adds the specified prefix to the prefix table. Must be done by the owner of the prefixes containing
+    /// Remove the specified prefix from the prefix table. Must be done by the owner of the prefixes containing
     /// AS and must include the signature of the message returned by IANA_getSignatureMessage for the new AS.
     /// @param ip The IP address of the prefix to add
     /// @param mask The number of bits in the netmask of the prefix to add
@@ -274,16 +282,16 @@ contract IANA {
     /// @param ASN The ASN to be added
     /// @param ASNOwner The public key of the new owner.
     /// @return bytes32 The keccak256 hash of abi.encodePacked(ASN,ASNOwner).
-    function IANA_getSignatureMessage(uint32 ASN, address ASNOwner) pure public returns(bytes32) {
-        return keccak256(abi.encodePacked(ASN,ASNOwner));
+    function IANA_getSignatureMessage(uint32 ASN, address ASNOwner, uint _nonce, bytes4 _functionName) pure public returns(bytes32) {
+        return keccak256(abi.encodePacked(ASN,ASNOwner,_nonce,_funtionName));
     }
     
     /// Generates the message text to be signed for add authentication.
     /// @param ASN The ASN to be added
     /// @param ASNOwner The public key of the new owner.
     /// @return bytes32 The kecckak256 hash of abi.encodePacked(ASN,ASNOwner).
-    function IANA_getPrefixSignatureMessage(uint32 ip, uint8 mask, uint32 ASN, address ASNOwner) pure public returns(bytes32) {
-        return keccak256(abi.encodePacked(ip, mask, ASN, ASNOwner));
+    function IANA_getPrefixSignatureMessage(uint32 ip, uint8 mask, uint32 ASN, address ASNOwner, uint nonce) pure public returns(bytes32) {
+        return keccak256(abi.encodePacked(ip, mask, ASN, ASNOwner, nonce));
     }
     
     /// Adds an additional ASN to the ASN list. The operation has to include a signature
@@ -292,14 +300,16 @@ contract IANA {
     /// @param ASN The ASN to be added
     /// @param ASNOwner The public key of the new owner.
     /// @param _signature The signature.
-    function IANA_addASN(uint32 ASN, address ASNOwner, bytes memory _signature) public onlyOwners {
+    function IANA_addASN(uint32 ASN, address ASNOwner, uint nonce, bytes memory _signature) public onlyOwners {
         // It must be signed by the new ASNOwner. We don't have to check for the IANA owner because
         // the onlyOwners routine does that for us.
-        require(ECDSA.recover(ECDSA.toEthSignedMessageHash(IANA_getSignatureMessage(ASN, ASNOwner)), _signature) == ASNOwner);
+        require(nonceUsedMap[ASNOwner][nonce] == false);
+        require(ECDSA.recover(ECDSA.toEthSignedMessageHash(IANA_getSignatureMessage(ASN, ASNOwner, nonce, this.IANA_addASN.selector)), _signature) == ASNOwner);
         require(ASN != 0);
         
         // At this point, we have two party agreement on ASN ownership. Add it to the ANSList.
         ASNList[ASN] = ASNOwner;
+        nonceUsedMap[ASNOwner][nonce] = true;
     }
 
     /// Removes an ASN to the ASN list. The operation has to include a signature
@@ -308,14 +318,16 @@ contract IANA {
     /// @param ASN The ASN to be added
     /// @param ASNOwner The public key of the new owner.
     /// @param _signature The signature.
-    function IANA_removeASN(uint32 ASN, address ASNOwner, bytes memory _signature) public onlyOwners {
+    function IANA_removeASN(uint32 ASN, address ASNOwner, uint nonce, bytes memory _signature) public onlyOwners {
         // It must be signed by the new ASNOwner. We don't have to check for the IANA owner because
         // the onlyOwners routine does that for us.
-        require(ECDSA.recover(ECDSA.toEthSignedMessageHash(IANA_getSignatureMessage(ASN, ASNOwner)), _signature) == ASNOwner);
+        require(nonceUsedMap[ASNOwner][nonce] == false);
+        require(ECDSA.recover(ECDSA.toEthSignedMessageHash(IANA_getSignatureMessage(ASN, ASNOwner, nonce, this.IANA_removeASN.selector)), _signature) == ASNOwner);
         require(ASN != 0);
         
         // At this point, we have two party agreement on ASN ownership. Mark the ASN as unowned
         ASNList[ASN] = address(0);
+        nonceUsedMap[ASNOwner][nonce] = true;
     }
 
     /// Adds an additional user to the owners table, allowing them to modify the discovery tables.
