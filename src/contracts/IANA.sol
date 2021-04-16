@@ -10,6 +10,7 @@ contract IANA {
         uint32 ip;
         uint8 mask;
         uint32 owningAS;
+        uint256 expiryOf;
         uint[] subPrefixes; // Pointer to prefix index in the larger prefixes array.
     }
     
@@ -25,7 +26,7 @@ contract IANA {
     // The associative mapping that maps ASNs to their owner's public key.
     mapping (uint32 => address) public ASNList;
     //  The user should sign the data along with a unique nonce value each time
-    mapping (address => mapping(uint => bool)) nonceUsedMap;
+    mapping (address => mapping(uint => bool)) public nonceUsedMap;
     // List of prefixes.
     Prefix[] public prefixes;
     // Holds the table of links keyed by sha256(encodePacked(ASN1,ASN2))
@@ -33,6 +34,8 @@ contract IANA {
     // This particular structure has the potential to be astoundingly large.
     mapping (bytes32 => bool) links;
 
+    uint private leaseTime = 365 days;
+    uint private renewPrefixPrice = 0.1 ether;
 
     /// Simple modifier to ensure that only owners can make changes
     modifier onlyOwners {
@@ -49,12 +52,17 @@ contract IANA {
         rootPrefix.ip = 0;
         rootPrefix.mask = 0;
         rootPrefix.owningAS = 0;
+        rootPrefix.expiryOf = type(uint).max;
         prefixes.push(rootPrefix);
 
         // Mark that the root is owned by a dummy address.
         ASNList[0] = address(0);
     }
 
+    function set_renewPrefixPrice(uint _price ) public onlyOwners {
+        renewPrefixPrice = _price ;
+    }
+    
     /// Compares the address spaces of two prefixes and determines if they are the same, do not intersect, or if one contains another.
     /// @param ip1 IP Address of the first prefix
     /// @param mask1 Number of bits in the subnet mask for the first prefix
@@ -178,16 +186,12 @@ contract IANA {
         require (mask <= 32);
         // Get the ASN's owner
         address newOwnerAddress = ASNList[newOwnerAS];
-        // check if the new owner has previously sent the signature with that nonce
-        require(nonceUsedMap[newOwnerAddress][nonce] == false);
         // The owning ASN must exist
         require (newOwnerAddress != address(0));
+        // check if the user has previously sent the signature with that nonce
+        require(nonceUsedMap[newOwnerAddress][nonce] == false);
         // The owning ASN must have signed the message.
         require(ECDSA.recover(ECDSA.toEthSignedMessageHash(IANA_getPrefixSignatureMessage(ip, mask, newOwnerAS, newOwnerAddress, nonce)), _signature) == newOwnerAddress);
-        
-        // the nonce should be stored on-chain
-        nonceUsedMap[ASNOwner][nonce] = true;
-
         // Find who owns the space this mask is in.
         uint parentIndex = prefix_getContainingPrefix(0,ip, mask);
         Prefix storage parent = prefixes[parentIndex];
@@ -213,19 +217,21 @@ contract IANA {
             // Require that we're not trying to take their prefix.
             require(result == PrefixCompareResult.NoIntersection);
         }
-        
+        // the nonce should be stored on-chain
+        nonceUsedMap[newOwnerAddress][nonce] = true;
+
         Prefix memory newPrefix;
         newPrefix.ip = ip;
         newPrefix.mask = mask;
         newPrefix.owningAS = newOwnerAS;
+        newPrefix.expiryOf = block.timestamp + leaseTime;
         prefixes.push(newPrefix);
         // Add it to the list
         uint index = prefixes.length - 1;
         parent.subPrefixes.push(index);
     }
     
-    /// Remove the specified prefix from the prefix table. Must be done by the owner of the prefixes containing
-    /// AS and must include the signature of the message returned by IANA_getSignatureMessage for the new AS.
+    /// Removes the specified prefix to the prefix table. Must be done by the owner of the prefixes containing
     /// @param ip The IP address of the prefix to add
     /// @param mask The number of bits in the netmask of the prefix to add
     function prefix_removePrefix(uint32 ip, uint8 mask) public {
@@ -237,9 +243,15 @@ contract IANA {
         Prefix storage target = prefixes[index];
         Prefix storage parent = prefixes[parentIndex];
 
-        // Require that the public address calling us owns the prefix
-        // (i.e. you can't claim addresses on someone else's prefix)
-        require (msg.sender == ASNList[target.owningAS]);
+        // Require that the public address that calls us has the prefix
+        // (i.e. you can't claim addresses in someone else's prefix)
+        // and the expireOf period is not expired.
+        // If expireOf is expired it requires that the public address belongs to ownerList
+        if (target.expiryOf > block.timestamp) {
+            require (msg.sender == ASNList[target.owningAS], "The public address that calls us doesn't own the prefix");
+        } else {
+            require (ownerList[msg.sender] == true, "The public address doesn't belong to ownerList");
+        }
         
         // The prefix must exactly reference the listed prefix.
         require(prefix_comparePrefix(target.ip, target.mask, ip, mask) == PrefixCompareResult.Equal);
@@ -252,6 +264,7 @@ contract IANA {
         blankPrefix.ip = 0;
         blankPrefix.mask = 0;
         blankPrefix.owningAS = 0;
+        blankPrefix.expiryOf = 0;
         prefixes[index] = blankPrefix;
         
         // This operation is EXPENSIVE. However, without it, the arrays could get long. Basically we're looking
@@ -270,7 +283,29 @@ contract IANA {
         }
     }
 
+    /// Renewal the specified prefix expiryOf. Must be done by the owner of the prefixes
+    /// @param ip The IP address of the prefix to add
+    /// @param mask The number of bits in the netmask of the prefix to add
+    function prefix_renewalPrefix(uint32 ip, uint8 mask) public payable {
+        // Only valid subnet masks
+        require (mask <= 32);
+        
+        // Paying the annual fee
+        require (msg.value == renewPrefixPrice);
 
+        // Find who owns the space this mask is in.
+        uint index = prefix_getContainingPrefix(0,ip, mask);
+        Prefix storage target = prefixes[index];
+
+        // The prefix must exactly reference the listed prefix.
+        require(prefix_comparePrefix(target.ip, target.mask, ip, mask) == PrefixCompareResult.Equal);
+        
+        require (target.expiryOf > block.timestamp);
+        require (msg.sender == ASNList[target.owningAS]);
+        
+        target.expiryOf = block.timestamp + leaseTime;
+    }
+    
     /// Returns the owner's address for the given ASN, or 0 if no one owns the ASN.
     /// @param ASN The ASN whose owner is to be returned
     /// @return address The address of the owner.
@@ -283,15 +318,17 @@ contract IANA {
     /// @param ASNOwner The public key of the new owner.
     /// @return bytes32 The keccak256 hash of abi.encodePacked(ASN,ASNOwner).
     function IANA_getSignatureMessage(uint32 ASN, address ASNOwner, uint _nonce, bytes4 _functionName) pure public returns(bytes32) {
-        return keccak256(abi.encodePacked(ASN,ASNOwner,_nonce,_funtionName));
+        // The user should sign the data along with a unique nonce value each time
+        return keccak256(abi.encodePacked(ASN,ASNOwner,_nonce,_functionName));
     }
-    
+
     /// Generates the message text to be signed for add authentication.
     /// @param ASN The ASN to be added
     /// @param ASNOwner The public key of the new owner.
     /// @return bytes32 The kecckak256 hash of abi.encodePacked(ASN,ASNOwner).
     function IANA_getPrefixSignatureMessage(uint32 ip, uint8 mask, uint32 ASN, address ASNOwner, uint nonce) pure public returns(bytes32) {
-        return keccak256(abi.encodePacked(ip, mask, ASN, ASNOwner, nonce));
+        // The user should sign the data along with a unique nonce value each time
+        return keccak256(abi.encodePacked(ip, mask, ASN, ASNOwner,nonce));
     }
     
     /// Adds an additional ASN to the ASN list. The operation has to include a signature
@@ -301,14 +338,16 @@ contract IANA {
     /// @param ASNOwner The public key of the new owner.
     /// @param _signature The signature.
     function IANA_addASN(uint32 ASN, address ASNOwner, uint nonce, bytes memory _signature) public onlyOwners {
+        // check if the user has previously sent the signature with that nonce
+        require(nonceUsedMap[ASNOwner][nonce] == false);
         // It must be signed by the new ASNOwner. We don't have to check for the IANA owner because
         // the onlyOwners routine does that for us.
-        require(nonceUsedMap[ASNOwner][nonce] == false);
-        require(ECDSA.recover(ECDSA.toEthSignedMessageHash(IANA_getSignatureMessage(ASN, ASNOwner, nonce, this.IANA_addASN.selector)), _signature) == ASNOwner);
+        require(ECDSA.recover(ECDSA.toEthSignedMessageHash(IANA_getSignatureMessage(ASN, ASNOwner, nonce, msg.sig)), _signature) == ASNOwner);
         require(ASN != 0);
         
         // At this point, we have two party agreement on ASN ownership. Add it to the ANSList.
         ASNList[ASN] = ASNOwner;
+        // the nonce should be stored on-chain
         nonceUsedMap[ASNOwner][nonce] = true;
     }
 
@@ -319,14 +358,20 @@ contract IANA {
     /// @param ASNOwner The public key of the new owner.
     /// @param _signature The signature.
     function IANA_removeASN(uint32 ASN, address ASNOwner, uint nonce, bytes memory _signature) public onlyOwners {
+        // check if the user has previously sent the signature with that nonce
+        require(nonceUsedMap[ASNOwner][nonce] == false);
         // It must be signed by the new ASNOwner. We don't have to check for the IANA owner because
         // the onlyOwners routine does that for us.
-        require(nonceUsedMap[ASNOwner][nonce] == false);
-        require(ECDSA.recover(ECDSA.toEthSignedMessageHash(IANA_getSignatureMessage(ASN, ASNOwner, nonce, this.IANA_removeASN.selector)), _signature) == ASNOwner);
+        require(ECDSA.recover(ECDSA.toEthSignedMessageHash(IANA_getSignatureMessage(ASN, ASNOwner, nonce, msg.sig)), _signature) == ASNOwner);
         require(ASN != 0);
         
+        for (uint i=0; i<prefixes.length; i++) {
+            require(prefixes[i].owningAS != ASN, "The ASN cannot be removed because it has prefixes associated with it.");
+        }
+            
         // At this point, we have two party agreement on ASN ownership. Mark the ASN as unowned
         ASNList[ASN] = address(0);
+        // the nonce should be stored on-chain
         nonceUsedMap[ASNOwner][nonce] = true;
     }
 
